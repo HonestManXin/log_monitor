@@ -18,54 +18,136 @@ child_pid = None
 #flag used by the subprocess determine if is killed by the parent process
 need_shutdown = False
 global_config = None
+metafile_extname_bak = ".meta.bak"
+metafile_extname = ".bak"
 
 class Processor(object):
-    def __init__(self, config, filename, fd, inode, out_dir, file_index=0, pos=0):
-        self._filename = filename
-        self._current_file_fullpath = os.path.join(config["monitor_dir"], filename)
+    """
+     base class for log file processor.
+    """
+    @staticmethod
+    def generate_outfilename(filename, index):
+        """
+        generate out file name according to the filename and the file index.
+        """
+        return filename + "." + str(index)
+
+    @staticmethod
+    def generate_outfile_fullpath(out_base_dir, timestamp_dir, filename):
+        """
+         generate out file full path.
+        """
+        dir_fullpath = os.path.join(out_base_dir, timestamp_dir)
+        file_fullpath = os.path.join(dir_fullpath, filename)
+        return file_fullpath
+
+    def __init__(self, config, file_state, fd, out_timestamp_dir):
+        """
+         init the processor.
+        """
+        need_update = False
+        if file_state["out_timestamp_dir"] != out_timestamp_dir:
+            file_state["out_timestamp_dir"] = out_timestamp_dir
+            file_state["file_index"] = 0
+            need_update = True
+        self._file_state = file_state
+        self._current_file_fullpath = os.path.join(config["monitor_dir"], file_state["filename"])
         self._fd = fd
-        self._inode = inode
-        self._pos = pos
-        self._out_dir = out_dir
-        self._outname = filename + "." + str(file_index)
-        self._file_index = file_index
+        self._out_timestamp_dir = out_timestamp_dir
+        self._out_size = 0
+        self._out_fd = None
+        self._outname = Processor.generate_outfilename(file_state["filename"], file_state["file_index"])
         self._config = config
+        self._output_fullpath = None
         self._get_current_outfile_info()
+        if need_update:
+            self.update_metainfo()
 
     def _get_current_outfile_info(self):
-        out_full_path = os.path.join(self._out_dir, self._outname)
-        if os.path.exists(out_full_path):
-            stat = os.stat(out_full_path)
+        """
+            get current out file infomation.
+            and open the out file.
+        """
+        self._output_fullpath = Processor.generate_outfile_fullpath(self._config["out_dir"], \
+            self._out_timestamp_dir, self._file_state["filename"])
+        if os.path.exists(self._output_fullpath):
+            stat = os.stat(self._output_fullpath)
             self._out_size = stat.st_size
         else:
             self._out_size = 0
-        self._out_fd = open(out_full_path, 'a+')
+        self._out_fd = open(self._output_fullpath, 'a+')
 
-    def _write_line(line):
+    def _update_file_index(self):
+        """
+        according to time_stamp_dir to decided increment the file_index.
+        """
+        right_first_slash = self._output_fullpath.rfind("/")
+        right_second_slash = self._output_fullpath.rfind("/", 0, right_first_slash)
+        old_timestamp_dir = self._output_fullpath[right_second_slash+1:right_first_slash]
+        if old_timestamp_dir != self._out_timestamp_dir:
+            log.warn("output dir seems changed from {old_dir} to {new_dir}".format(\
+                old_dir=old_timestamp_dir, new_dir=self._out_timestamp_dir))
+        else:
+            self._file_state["file_index"] += 1
+
+    def _write_line(self, line):
         """
             write one line log to the outname.
         """
         self._out_fd.write(line)
         self._out_size += len(line)
-        self._pos = self._fd.tell()
+        self._file_state["pos"] = self._fd.tell()
         if self._out_size >= self._config["zip_size"]:
-            self._file_index += 1
+            self._out_fd.close()
+            #self._file_state["file_index"] += 1
+            self._update_file_index()
             self.update_metainfo()
             #start zip file
-            pass
+            shell_command = "gzip {filename} &".format(filename=self._output_fullpath)
+            os.system(shell_command)
+            #open new outname
+            self._outname = Processor.generate_outfilename(self._file_state["filename"], self._file_state["file_index"])
+            self._output_fullpath = Processor.generate_outfile_fullpath(self._config["out_dir"], \
+                self._out_timestamp_dir, self._outname)
+            self._out_fd = open(self._output_fullpath, 'a+')
         else:
             self.update_metainfo()
 
     def process(self):
+        """
+         this method process each log file.
+        """
         raise NotImplementedError
 
-    def update_outdir(self):
-        raise NotImplementedError
+    def update_outdir(self, timestamp_dir):
+        """
+            update out dir.
+            but it doesn't change it right now.
+        """
+        assert timestamp_dir != None
+        if timestamp_dir:
+            self._out_timestamp_dir = timestamp_dir
+            self._file_state["out_timestamp_dir"] = timestamp_dir
+            self._file_state["file_index"] = 0
+            self.update_metainfo()
 
     def update_metainfo(self):
-        pass
+        """
+        update this log file's info.
+        """
+        meta_dir = self._config["meta_dir"]
+        meta_bak_filename = os.path.join(meta_dir, self._file_state["filename"] + metafile_extname_bak)
+        meta_filename = os.path.join(meta_dir, self._file_state["filename"] + metafile_extname)
+        meta = shelve.open(meta_bak_filename, 'n')
+        for k in self._file_state:
+            meta[k] = self._file_state[k]
+        meta.close()
+        os.rename(meta_bak_filename, meta_filename)
 
 class LogFileProcessor(Processor):
+    """
+    normal file processor.
+    """
     def __init__(self, *args, **kargs):
         super(LogFileProcessor, self).__init__(*args, **kargs)
 
@@ -74,30 +156,34 @@ class LogFileProcessor(Processor):
             self._write_line(line)
 
         stat = os.stat(self._current_file_fullpath)
-        if stat.st_ino == self._inode:
+        if stat.st_ino == self._file_state["inode"]:
             return self
         else:
-            log.warn("log file {filename} seems has been rotated".format(filename=self._filename))
+            log.warn("log file {filename} seems has been rotated".format(filename=self._file_state["filename"]))
             #update the fd infos
             return self         
 
 class RotateFileProcessor(Processor):
+    """
+        this processor will be used only when the processor was restart and the log file was rotated
+    """
     def __init__(self, *args, **kargs):
         super(RotateFileProcessor, self).__init__(*args, **kargs)
 
     def process(self):
         for line in self._fd:
             self._write_line(line)
-        log.info("rotated log file {inode} has been readed. change to real file".format(inode=self._inode))
-        real_log_filepath = os.path.join(self._config["monitor_dir"], self._filename)
+        log.info("rotated log file {inode} has been readed. change to real file".format(inode=self._file_state["inode"]))
+        real_log_filepath = os.path.join(self._config["monitor_dir"], self._file_state["filename"])
         # there may have a trival bug.
         # when between open fd and get the inode ,log file happends rotate again.
         fd = open(real_log_filepath, 'r')
         inode = os.stat(real_log_filepath).st_ino
         #
-        processor = LogFileProcessor(self._config, self._filename, fd, inode, self._out_dir, \
-            self._file_index)
-
+        self._file_state["inode"] = inode
+        self._file_state["pos"] = 0
+        processor = LogFileProcessor(self._config, self._file_state, fd, self._out_timestamp_dir)
+        return processor
 
 
 def is_legal_log_file(config, filename):
@@ -118,12 +204,7 @@ def check_point(config):
     """
     check if there are files are removed.
     """
-    pass
-
-def change_output_dir(config):
-    """
-    """
-    pass   
+    pass  
 
 def get_monitor_dir_information(config):
     """
@@ -146,9 +227,6 @@ def get_monitor_dir_information(config):
 def recover_all_meta_info(config):
     pass
 
-def update_infomation(filename, info_dict):
-    pass
-
 def run():
     """
         start monitor log_dir.
@@ -157,7 +235,7 @@ def run():
     inode_filename_map, legal_file_list = get_monitor_dir_information(config)
     while not need_shutdown:
         # consider some log file may removed situation   
-
+        pass
         #
 
 def register_subprocess_sighandler():
@@ -296,7 +374,7 @@ def check_config(config):
     """
         check config arguments.
     """
-    properties = ["monitor_dir", "log_dir", "meta_dir", \
+    properties = ["monitor_dir", "log_dir", "meta_dir", "out_dir", \
         "black_list", "white_list", "ext_blacklist", \
         "zip_size", "rotate_dir_time", "rotate_dir_time_format"]
     config_not_exist_error = []
@@ -307,7 +385,7 @@ def check_config(config):
         sys.stderr.write("\n".join(config_not_exist_error))
         sys.exit(1)
     errors = []
-    for each_pro in ["monitor_dir", "log_dir", "meta_dir"]:
+    for each_pro in ["monitor_dir", "log_dir", "meta_dir", "out_dir"]:
         if not os.path.exists(config[each_pro]) or not os.path.isdir(config[each_pro]):
             errors.append(each_pro + " does not exists or it is not a directory")
 
@@ -342,7 +420,7 @@ def main():
     """
     global global_config
     parser = build_option_parser()
-    options = parser.parse_args()
+    (options, _) = parser.parse_args()
     global_config = parse_configfile(options["config_file"])
     check_config(global_config)
     build_logger(global_config["log_dir"], "main")
