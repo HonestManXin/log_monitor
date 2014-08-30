@@ -27,10 +27,7 @@ metafile_extname = ".meta"
 # filename file_index 
 # out_timestamp_dir inode pos
 
-class Processor(object):
-    """
-     base class for log file processor.
-    """
+class OutHandler(object):
     @staticmethod
     def generate_outfilename(filename, index):
         """
@@ -46,100 +43,34 @@ class Processor(object):
         dir_fullpath = os.path.join(out_base_dir, timestamp_dir)
         file_fullpath = os.path.join(dir_fullpath, filename)
         return file_fullpath
+    def __init__(self, filename, out_base_dir):
+        pass
 
-    def __init__(self, config, file_state, fd, out_timestamp_dir):
+    def process_line(self, line):
+        pass
+
+
+class Processor(object):
+    """
+     base class for log file processor.
+    """
+
+    def __init__(self, config, file_state, fd):
         """
          init the processor.
         """
-        need_update = False
-        if file_state["out_timestamp_dir"] != out_timestamp_dir:
-            file_state["out_timestamp_dir"] = out_timestamp_dir
-            file_state["file_index"] = 0
-            need_update = True
         self._file_state = file_state
         self._current_file_fullpath = os.path.join(config["monitor_dir"], file_state["filename"])
         self._fd = fd
-        self._out_timestamp_dir = out_timestamp_dir
-        self._out_size = 0
-        self._out_fd = None
-        self._outname = Processor.generate_outfilename(file_state["filename"], file_state["file_index"])
         self._config = config
-        self._output_fullpath = None
-        self._get_current_outfile_info()
-        if need_update:
-            self.update_metainfo()
-
-    def _get_current_outfile_info(self):
-        """
-            get current out file infomation.
-            and open the out file.
-        """
-        self._output_fullpath = Processor.generate_outfile_fullpath(self._config["out_dir"], \
-            self._out_timestamp_dir, self._outname)
-        if os.path.exists(self._output_fullpath):
-            stat = os.stat(self._output_fullpath)
-            self._out_size = stat.st_size
-        else:
-            self._out_size = 0
-        self._out_fd = open(self._output_fullpath, 'a')
-
-    def _update_file_index(self):
-        """
-        according to time_stamp_dir to decided increment the file_index.
-        """
-        right_first_slash = self._output_fullpath.rfind("/")
-        right_second_slash = self._output_fullpath.rfind("/", 0, right_first_slash)
-        old_timestamp_dir = self._output_fullpath[right_second_slash+1:right_first_slash]
-        if old_timestamp_dir != self._out_timestamp_dir:
-            # This happends when the output dir need rotate
-            log.warn("output dir seems changed from {old_dir} to {new_dir}".format(\
-                old_dir=old_timestamp_dir, new_dir=self._out_timestamp_dir))
-        else:
-            self._file_state["file_index"] += 1
-
-    def _process_line(self, line):
-        """
-            write one line log to the outname.
-        """
-        self._out_fd.write(line)
-        self._out_size += len(line)
-        self._file_state["pos"] = self._fd.tell()
-        if self._out_size >= self._config["zip_size"]:
-            self._out_fd.close()
-            #self._file_state["file_index"] += 1
-            self._update_file_index()
-            self.update_metainfo()
-            #start zip file
-            shell_command = "gzip {filename} &".format(filename=self._output_fullpath)
-            os.system(shell_command)
-            #open new outname
-            self._outname = Processor.generate_outfilename(self._file_state["filename"], self._file_state["file_index"])
-            self._output_fullpath = Processor.generate_outfile_fullpath(self._config["out_dir"], \
-                self._out_timestamp_dir, self._outname)
-            self._out_fd = open(self._output_fullpath, 'a+')
-            self._out_size = 0
-        else:
-            self.update_metainfo()
+        self.update_metainfo()
+        self._fd.seek(file_state["pos"])
 
     def process(self):
         """
          this method process each log file.
         """
         raise NotImplementedError
-
-    def update_outdir(self, timestamp_dir):
-        """
-            update out dir.
-            but it doesn't change it right now.
-        """
-        assert timestamp_dir != None
-        log.info("{filename} outdir changed from {old_dir} to {new_dir}".format(\
-            filename=self._file_state["filename"], old_dir=self._out_timestamp_dir, new_dir=timestamp_dir))
-        if timestamp_dir:
-            self._out_timestamp_dir = timestamp_dir
-            self._file_state["out_timestamp_dir"] = timestamp_dir
-            self._file_state["file_index"] = 0
-            self.update_metainfo()
 
     def update_metainfo(self):
         """
@@ -162,16 +93,29 @@ class LogFileProcessor(Processor):
         super(LogFileProcessor, self).__init__(*args, **kargs)
 
     def process(self):
+        # for debug purpose
         for line in self._fd:
-            self._process_line(line)
+            #self._process_line(line)
+            pass
 
         stat = os.stat(self._current_file_fullpath)
         if stat.st_ino == self._file_state["inode"]:
             return self
         else:
             log.warn("log file {filename} seems has been rotated".format(filename=self._file_state["filename"]))
-            #update the fd infos
-            return self         
+            # update the fd infos
+            self._fd.close()
+            self._file_state["pos"] = 0
+            self._file_state["inode"] = stat.st_ino
+            self.update_metainfo()
+            self._fd = open(self._current_file_fullpath, 'r')
+            return self
+
+    def set_read_postion_to_end(self):
+        """
+        set read pos from the end of the file.
+        """
+        self._fd.seek(0, 2)         
 
 class RotateFileProcessor(Processor):
     """
@@ -181,6 +125,7 @@ class RotateFileProcessor(Processor):
         super(RotateFileProcessor, self).__init__(*args, **kargs)
 
     def process(self):
+        # for debug purpose
         for line in self._fd:
             self._process_line(line)
         log.info("rotated log file {inode} has been readed. change to real file".format(inode=self._file_state["inode"]))
@@ -208,11 +153,15 @@ def is_legal_log_file(config, filename):
     for reg_exp in config["ext_blacklist"]:
         if reg_exp.match(filename):
             return False
-    return True
+    # TODO add ext_whitelist
+    if filename.endswith(".log"):
+        return True
+    return False
  
-def check_dir_update_point(config, filename_processor_map, out_timestamp_dir, last_check_time):
+def check_dir_update_point(config, filename_processor_map, last_check_time):
     """
     check if there are files are removed or some new logs are added.
+    return last_check_time. last_check_time may be modifyed.
     """
     current_time = time.time()
     # current set it as one minute
@@ -221,23 +170,8 @@ def check_dir_update_point(config, filename_processor_map, out_timestamp_dir, la
     last_check_time = current_time
     inode_filename_map, legal_file_list = get_monitor_dir_information(config)
     #current not delete old entry
-    add_new_logfile_processor(config, filename_processor_map, inode_filename_map, legal_file_list, out_timestamp_dir)
+    add_new_logfile_processor(config, filename_processor_map, inode_filename_map, legal_file_list)
     return last_check_time
-
-def check_need_rotate_outdir(config, filename_processor_map, last_out_timestamp_dir):
-    """
-    check if it's time to rotate the dir.
-    if so, change it.
-    """
-    now = datetime.datetime.now()
-    if now.minute % 5 == 0:
-        current_out_timestmp_dir = compute_current_out_timestmp_dir(config, now)
-        if current_out_timestmp_dir != last_out_timestamp_dir:
-            # update
-            for _, processor in filename_processor_map.iteritems():
-                processor.update_outdir(current_out_timestmp_dir)
-        last_out_timestamp_dir = current_out_timestmp_dir
-    return last_out_timestamp_dir
 
 def get_monitor_dir_information(config):
     """
@@ -250,7 +184,7 @@ def get_monitor_dir_information(config):
     for filename in os.listdir(monitor_dir):
         file_full_path = os.path.join(monitor_dir, filename)
         stat = os.stat(file_full_path)
-        inode_filename_map[filename] = stat.st_ino
+        inode_filename_map[stat.st_ino] = filename
         if is_legal_log_file(config, filename):
             legal_file_list.append(filename)
     #print inode_filename_map
@@ -260,8 +194,9 @@ def get_inode_from_inode_filename_map(file_name, inode_filename_map):
     """
     get {file_name} inode information from inode_filename_map.
     """
-    print file_name
-    print inode_filename_map
+    # for debug purpose
+    # print file_name
+    # print inode_filename_map
     for inode in inode_filename_map:
         if inode_filename_map[inode] == file_name:
             return inode
@@ -277,11 +212,13 @@ def recover_all_meta_info(config):
     for file_name in os.listdir(meta_dir):
         if file_name.endswith(metafile_extname):
             meta_fullname = os.path.join(meta_dir, file_name)
-            with shelve.open(meta_fullname, 'r') as meta_file:
-                meta_info[file_name] = dict(meta_file)
+            meta_file = shelve.open(meta_fullname, 'r')
+            meta = dict(meta_file)
+            meta_info[meta["filename"]] = meta
+            meta_file.close()
     return meta_info
 
-def add_new_logfile_processor(config, filename_processor_map, inode_filename_map, legal_file_list, out_timestamp_dir):
+def add_new_logfile_processor(config, filename_processor_map, inode_filename_map, legal_file_list, start_from_end=False):
     """
     find the if log file in legal_file_list has been add to filename_processor_map.
     """
@@ -292,57 +229,40 @@ def add_new_logfile_processor(config, filename_processor_map, inode_filename_map
             log.info("{filename} has been add at {time_stamp}".format( \
                 filename=file_name, time_stamp=current_time.strftime("%Y-%m-%d %H:%M:%S")))
             inode = get_inode_from_inode_filename_map(file_name, inode_filename_map)
-            meta = {"filename": file_name, "pos": 0, "file_index":0, \
-                "out_timestamp_dir": out_timestamp_dir, "inode": inode}
+            meta = {"filename": file_name, "pos": 0, "inode": inode}
             file_fullname = os.path.join(monitor_dir, file_name)
             fd = open(file_fullname, 'r')
-            processor = LogFileProcessor(config, meta, fd, out_timestamp_dir)
+            processor = LogFileProcessor(config, meta, fd)
+            if start_from_end:
+                processor.set_read_postion_to_end()
             filename_processor_map[file_name] = processor
 
-def get_log_file_processor(config, meta_info, inode_filename_map, legal_file_list, out_timestamp_dir):
+def get_log_file_processor(config, meta_info, inode_filename_map, legal_file_list):
     """
     return processor for each log file.
     different type log file will be processed by different processor.
     """
+    monitor_dir = config["monitor_dir"]
     filename_processor_map = {}
     for meta_name in meta_info:
         meta = meta_info[meta_name]
         inode = meta["inode"]
         if inode in inode_filename_map:
             if meta_name == inode_filename_map[inode]:
-                fd = open(meta_name, 'r')
-                processor = LogFileProcessor(config, meta, fd, out_timestamp_dir)
+                file_fullname = os.path.join(monitor_dir, meta_name)
+                fd = open(file_fullname, 'r')
+                processor = LogFileProcessor(config, meta, fd)
             else:
                 log.info("{filename} has been rotated".format(filename=meta_name))
-                fd = open(inode_filename_map[inode], 'r')
-                processor = RotateFileProcessor(config, meta, fd, out_timestamp_dir)
+                file_fullname = os.path.join(monitor_dir, inode_filename_map[inode])
+                fd = open(file_fullname, 'r')
+                processor = RotateFileProcessor(config, meta, fd)
         else:
             log.warn("{filename} seems been deleted".format(filename=meta_name))
             continue
         filename_processor_map[meta_name] = processor
-    add_new_logfile_processor(config, filename_processor_map, inode_filename_map, legal_file_list, out_timestamp_dir)
+    add_new_logfile_processor(config, filename_processor_map, inode_filename_map, legal_file_list)
     return filename_processor_map
-
-def compute_current_out_timestmp_dir(config, time_stamp=None):
-    """
-    time_stamp is instance of datetime.
-    return dir name represented as time time_stamp format.
-    """
-    if time_stamp:
-        out_timestamp_dir_name = time_stamp.strftime(config["rotate_dir_time_format"])
-    else:
-        time_stamp = datetime.datetime.now()
-        minute = time_stamp.minute
-        if minute % 5 == 0:
-            out_timestamp_dir_name = time_stamp.strftime(config["rotate_dir_time_format"])
-        else:
-            proper_time = time_stamp - datetime.timedelta(seconds=60*(minute%5))
-            out_timestamp_dir_name = proper_time.strftime(config["rotate_dir_time_format"])
-    out_dir = config["out_dir"]
-    full_path = os.path.join(out_dir, out_timestamp_dir_name)
-    if not os.path.exists(full_path):
-        os.mkdir(full_path)
-    return out_timestamp_dir_name
 
 def run(config):
     """
@@ -350,13 +270,11 @@ def run(config):
     """
     meta_info = recover_all_meta_info(config)
     inode_filename_map, legal_file_list = get_monitor_dir_information(config)
-    last_out_timestamp_dir = compute_current_out_timestmp_dir(config)
-    filename_processor_map = get_log_file_processor(config, meta_info, inode_filename_map, legal_file_list, last_out_timestamp_dir)
+    filename_processor_map = get_log_file_processor(config, meta_info, inode_filename_map, legal_file_list)
     last_check_time = time.time()
     while not need_shutdown:
         # consider some log file may removed situation   
-        last_check_time = check_dir_update_point(config, filename_processor_map, last_out_timestamp_dir, last_check_time)
-        last_out_timestamp_dir = check_need_rotate_outdir(config, filename_processor_map, last_out_timestamp_dir)
+        last_check_time = check_dir_update_point(config, filename_processor_map, last_check_time)
         for _, processor in filename_processor_map.iteritems():
             processor.process()
         #for debug purpose

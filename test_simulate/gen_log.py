@@ -48,6 +48,7 @@ def write_log():
         for open_file in open_file_list:
             line = get_log_line()
             open_file.write(line)
+            open_file.flush()
         time.sleep(1)
 
 def write_pid():

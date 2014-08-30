@@ -2,6 +2,7 @@
 import os
 import datetime
 import signal
+import time
 
 PID_FILE="/home/turing/workspace/log_monitor/test_simulate/pid.txt"
 LOG_DIR="/var/log/nginx"
@@ -34,8 +35,10 @@ def reload_log_process():
     os.kill(pid, signal.SIGUSR1)
 
 def main():
-    rotate_file()
-    reload_log_process()
+    while True:
+        time.sleep(60)
+        rotate_file()
+        reload_log_process()
 
 if __name__ == "__main__":
     main()
