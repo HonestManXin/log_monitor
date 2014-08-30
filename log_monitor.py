@@ -9,6 +9,7 @@ import ConfigParser
 import signal
 import shelve
 import time
+import datetime
 import logging
 import optparse
 import re
@@ -19,7 +20,12 @@ child_pid = None
 need_shutdown = False
 global_config = None
 metafile_extname_bak = ".meta.bak"
-metafile_extname = ".bak"
+metafile_extname = ".meta"
+
+# file_state dictionary
+# 
+# filename file_index 
+# out_timestamp_dir inode pos
 
 class Processor(object):
     """
@@ -69,13 +75,13 @@ class Processor(object):
             and open the out file.
         """
         self._output_fullpath = Processor.generate_outfile_fullpath(self._config["out_dir"], \
-            self._out_timestamp_dir, self._file_state["filename"])
+            self._out_timestamp_dir, self._outname)
         if os.path.exists(self._output_fullpath):
             stat = os.stat(self._output_fullpath)
             self._out_size = stat.st_size
         else:
             self._out_size = 0
-        self._out_fd = open(self._output_fullpath, 'a+')
+        self._out_fd = open(self._output_fullpath, 'a')
 
     def _update_file_index(self):
         """
@@ -85,12 +91,13 @@ class Processor(object):
         right_second_slash = self._output_fullpath.rfind("/", 0, right_first_slash)
         old_timestamp_dir = self._output_fullpath[right_second_slash+1:right_first_slash]
         if old_timestamp_dir != self._out_timestamp_dir:
+            # This happends when the output dir need rotate
             log.warn("output dir seems changed from {old_dir} to {new_dir}".format(\
                 old_dir=old_timestamp_dir, new_dir=self._out_timestamp_dir))
         else:
             self._file_state["file_index"] += 1
 
-    def _write_line(self, line):
+    def _process_line(self, line):
         """
             write one line log to the outname.
         """
@@ -110,6 +117,7 @@ class Processor(object):
             self._output_fullpath = Processor.generate_outfile_fullpath(self._config["out_dir"], \
                 self._out_timestamp_dir, self._outname)
             self._out_fd = open(self._output_fullpath, 'a+')
+            self._out_size = 0
         else:
             self.update_metainfo()
 
@@ -125,6 +133,8 @@ class Processor(object):
             but it doesn't change it right now.
         """
         assert timestamp_dir != None
+        log.info("{filename} outdir changed from {old_dir} to {new_dir}".format(\
+            filename=self._file_state["filename"], old_dir=self._out_timestamp_dir, new_dir=timestamp_dir))
         if timestamp_dir:
             self._out_timestamp_dir = timestamp_dir
             self._file_state["out_timestamp_dir"] = timestamp_dir
@@ -153,7 +163,7 @@ class LogFileProcessor(Processor):
 
     def process(self):
         for line in self._fd:
-            self._write_line(line)
+            self._process_line(line)
 
         stat = os.stat(self._current_file_fullpath)
         if stat.st_ino == self._file_state["inode"]:
@@ -172,7 +182,7 @@ class RotateFileProcessor(Processor):
 
     def process(self):
         for line in self._fd:
-            self._write_line(line)
+            self._process_line(line)
         log.info("rotated log file {inode} has been readed. change to real file".format(inode=self._file_state["inode"]))
         real_log_filepath = os.path.join(self._config["monitor_dir"], self._file_state["filename"])
         # there may have a trival bug.
@@ -200,11 +210,34 @@ def is_legal_log_file(config, filename):
             return False
     return True
  
-def check_point(config):
+def check_dir_update_point(config, filename_processor_map, out_timestamp_dir, last_check_time):
     """
-    check if there are files are removed.
+    check if there are files are removed or some new logs are added.
     """
-    pass  
+    current_time = time.time()
+    # current set it as one minute
+    if current_time - last_check_time < 60:
+        return last_check_time
+    last_check_time = current_time
+    inode_filename_map, legal_file_list = get_monitor_dir_information(config)
+    #current not delete old entry
+    add_new_logfile_processor(config, filename_processor_map, inode_filename_map, legal_file_list, out_timestamp_dir)
+    return last_check_time
+
+def check_need_rotate_outdir(config, filename_processor_map, last_out_timestamp_dir):
+    """
+    check if it's time to rotate the dir.
+    if so, change it.
+    """
+    now = datetime.datetime.now()
+    if now.minute % 5 == 0:
+        current_out_timestmp_dir = compute_current_out_timestmp_dir(config, now)
+        if current_out_timestmp_dir != last_out_timestamp_dir:
+            # update
+            for _, processor in filename_processor_map.iteritems():
+                processor.update_outdir(current_out_timestmp_dir)
+        last_out_timestamp_dir = current_out_timestmp_dir
+    return last_out_timestamp_dir
 
 def get_monitor_dir_information(config):
     """
@@ -217,26 +250,117 @@ def get_monitor_dir_information(config):
     for filename in os.listdir(monitor_dir):
         file_full_path = os.path.join(monitor_dir, filename)
         stat = os.stat(file_full_path)
-        inode_filename_map[stat.st_ino] = filename
+        inode_filename_map[filename] = stat.st_ino
         if is_legal_log_file(config, filename):
             legal_file_list.append(filename)
-
+    #print inode_filename_map
     return inode_filename_map, legal_file_list
 
+def get_inode_from_inode_filename_map(file_name, inode_filename_map):
+    """
+    get {file_name} inode information from inode_filename_map.
+    """
+    print file_name
+    print inode_filename_map
+    for inode in inode_filename_map:
+        if inode_filename_map[inode] == file_name:
+            return inode
+    # nerver go there
+    log.error("fatal error happens, can not get {file_name} inode inode_filename_map".format(file_name=file_name))
 
 def recover_all_meta_info(config):
-    pass
+    """
+     read all the meta info in the meta directory.
+    """
+    meta_dir = config["meta_dir"]
+    meta_info = {}
+    for file_name in os.listdir(meta_dir):
+        if file_name.endswith(metafile_extname):
+            meta_fullname = os.path.join(meta_dir, file_name)
+            with shelve.open(meta_fullname, 'r') as meta_file:
+                meta_info[file_name] = dict(meta_file)
+    return meta_info
 
-def run():
+def add_new_logfile_processor(config, filename_processor_map, inode_filename_map, legal_file_list, out_timestamp_dir):
+    """
+    find the if log file in legal_file_list has been add to filename_processor_map.
+    """
+    monitor_dir = config["monitor_dir"]
+    for file_name in legal_file_list:
+        if file_name not in filename_processor_map:
+            current_time = datetime.datetime.now()
+            log.info("{filename} has been add at {time_stamp}".format( \
+                filename=file_name, time_stamp=current_time.strftime("%Y-%m-%d %H:%M:%S")))
+            inode = get_inode_from_inode_filename_map(file_name, inode_filename_map)
+            meta = {"filename": file_name, "pos": 0, "file_index":0, \
+                "out_timestamp_dir": out_timestamp_dir, "inode": inode}
+            file_fullname = os.path.join(monitor_dir, file_name)
+            fd = open(file_fullname, 'r')
+            processor = LogFileProcessor(config, meta, fd, out_timestamp_dir)
+            filename_processor_map[file_name] = processor
+
+def get_log_file_processor(config, meta_info, inode_filename_map, legal_file_list, out_timestamp_dir):
+    """
+    return processor for each log file.
+    different type log file will be processed by different processor.
+    """
+    filename_processor_map = {}
+    for meta_name in meta_info:
+        meta = meta_info[meta_name]
+        inode = meta["inode"]
+        if inode in inode_filename_map:
+            if meta_name == inode_filename_map[inode]:
+                fd = open(meta_name, 'r')
+                processor = LogFileProcessor(config, meta, fd, out_timestamp_dir)
+            else:
+                log.info("{filename} has been rotated".format(filename=meta_name))
+                fd = open(inode_filename_map[inode], 'r')
+                processor = RotateFileProcessor(config, meta, fd, out_timestamp_dir)
+        else:
+            log.warn("{filename} seems been deleted".format(filename=meta_name))
+            continue
+        filename_processor_map[meta_name] = processor
+    add_new_logfile_processor(config, filename_processor_map, inode_filename_map, legal_file_list, out_timestamp_dir)
+    return filename_processor_map
+
+def compute_current_out_timestmp_dir(config, time_stamp=None):
+    """
+    time_stamp is instance of datetime.
+    return dir name represented as time time_stamp format.
+    """
+    if time_stamp:
+        out_timestamp_dir_name = time_stamp.strftime(config["rotate_dir_time_format"])
+    else:
+        time_stamp = datetime.datetime.now()
+        minute = time_stamp.minute
+        if minute % 5 == 0:
+            out_timestamp_dir_name = time_stamp.strftime(config["rotate_dir_time_format"])
+        else:
+            proper_time = time_stamp - datetime.timedelta(seconds=60*(minute%5))
+            out_timestamp_dir_name = proper_time.strftime(config["rotate_dir_time_format"])
+    out_dir = config["out_dir"]
+    full_path = os.path.join(out_dir, out_timestamp_dir_name)
+    if not os.path.exists(full_path):
+        os.mkdir(full_path)
+    return out_timestamp_dir_name
+
+def run(config):
     """
         start monitor log_dir.
     """
     meta_info = recover_all_meta_info(config)
     inode_filename_map, legal_file_list = get_monitor_dir_information(config)
+    last_out_timestamp_dir = compute_current_out_timestmp_dir(config)
+    filename_processor_map = get_log_file_processor(config, meta_info, inode_filename_map, legal_file_list, last_out_timestamp_dir)
+    last_check_time = time.time()
     while not need_shutdown:
         # consider some log file may removed situation   
-        pass
-        #
+        last_check_time = check_dir_update_point(config, filename_processor_map, last_out_timestamp_dir, last_check_time)
+        last_out_timestamp_dir = check_need_rotate_outdir(config, filename_processor_map, last_out_timestamp_dir)
+        for _, processor in filename_processor_map.iteritems():
+            processor.process()
+        #for debug purpose
+        time.sleep(1)
 
 def register_subprocess_sighandler():
     """
@@ -274,10 +398,12 @@ def build_logger(log_dir, name):
     create the logger for the app.
     name is used to distinguish different processes.
     """
-    formatter = logging.Formatter(fmt="%(levelname)s %(asctime)s %(funcName)s %(message)s", \
+    formatter = logging.Formatter(fmt="%(levelname)s %(asctime)s %(lineno)d %(funcName)s %(message)s", \
         datefmt="%Y-%m-%d %H:%M:%S")
     log_full_name = log_dir + os.sep + "log_" + name + ".txt"
-    handler = logging.handlers.TimedRotatingFileHandler(log_full_name, when="D", encoding="encoding")
+    from logging import handlers
+    #handler = handlers.TimedRotatingFileHandler(log_full_name, when="D", encoding="utf-8")
+    handler = logging.StreamHandler()
     handler.setFormatter(formatter)
     log.addHandler(handler)
 
@@ -314,6 +440,7 @@ def parse_configfile(config_file):
                     self._section = None
             else:
                 return self._fd.readline()
+
     if not os.path.exists(config_file):
         sys.stderr.write("config file " + config_file + " does not exists \n")
         sys.exit(1)
@@ -326,39 +453,7 @@ def parse_configfile(config_file):
     for k, v in cp.items(_dummy_section, raw=True):
         config_info[k] = v
     config_fd.close()
-    def to_list(key, value):
-        """
-         convert to value to list. And the value is space delimiter.
-        """
-        try:
-            values = re.split(r"\s+", value)
-            values = [i for i in values if i != '']
-            return values
-        except Exception, e:
-            error_string = "{key}='{value}' format is not correct\n".format(key=key, value=value)
-            sys.stderr.write(error_string)
-            raise e
-
-    def to_end_with_reg_list(key, value):
-        """
-        convert each value to reg list.
-        """
-        values = to_list(key, value)
-        reg_list = []
-        for item in values:
-            reg_list.append(re.compile(item + r"$"))
-        return reg_list
-
-    def to_int(key, value):
-        """
-            convert value to int.
-        """
-        try:
-            return int(value)
-        except Exception, e:
-            error_string = "{key}='{value}' is not a int number \n".format(key=key, value=value)
-            sys.stderr.write(error_string)
-            raise e
+    from log_util import to_list, to_int, to_end_with_reg_list
     parser = {
         "black_list": to_list,
         "white_list": to_list,
@@ -408,7 +503,7 @@ def fork_worker_process():
         log.error("can not create sub process")
         sys.exit(1)
     elif pid == 0:
-        run()
+        run(global_config)
     else:
         log.info("fork sub process success " + str(pid))
         global child_pid
@@ -421,13 +516,16 @@ def main():
     global global_config
     parser = build_option_parser()
     (options, _) = parser.parse_args()
-    global_config = parse_configfile(options["config_file"])
+    global_config = parse_configfile(options.config_file)
     check_config(global_config)
     build_logger(global_config["log_dir"], "main")
     register_mainprocess_sighandler()
-    while not need_shutdown:
-        fork_worker_process()
-        os.wait()
+
+    fork_worker_process()
+    os.wait()
+    # while not need_shutdown:
+    #     fork_worker_process()
+    #     os.wait()
 
 if __name__ == '__main__':
     main()
