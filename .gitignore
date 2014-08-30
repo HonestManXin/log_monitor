@@ -1,6 +1,7 @@
 *.pyc
 *.log
 log/*
+output/*
 meta/*
 .DS_Store
 ._.DS_Store
