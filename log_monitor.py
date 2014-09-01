@@ -24,31 +24,25 @@ metafile_extname = ".meta"
 
 # file_state dictionary
 # 
-# filename file_index 
-# out_timestamp_dir inode pos
+# filename
+# file_index 
+# out_timestamp_dir 
+# inode 
+# pos
 
 class OutHandler(object):
-    @staticmethod
-    def generate_outfilename(filename, index):
-        """
-        generate out file name according to the filename and the file index.
-        """
-        return filename + "." + str(index)
-
-    @staticmethod
-    def generate_outfile_fullpath(out_base_dir, timestamp_dir, filename):
-        """
-         generate out file full path.
-        """
-        dir_fullpath = os.path.join(out_base_dir, timestamp_dir)
-        file_fullpath = os.path.join(dir_fullpath, filename)
-        return file_fullpath
-    def __init__(self, filename, out_base_dir):
-        pass
-
     def process_line(self, line):
-        pass
+        raise NotImplementedError
 
+class BasicOutHandler(OutHandler):
+    def __init__(self, filename, out_base_dir):
+        super(BasicOutHandler, self).__init__()
+        file_fullname = os.path.join(out_base_dir, filename)
+        self._fd = open(file_fullname, 'a')
+    
+    def process_line(self, line):
+        self._fd.write(line)
+        self._fd.flush()
 
 class Processor(object):
     """
@@ -65,6 +59,7 @@ class Processor(object):
         self._config = config
         self.update_metainfo()
         self._fd.seek(file_state["pos"])
+        self._outhandler = BasicOutHandler(file_state["filename"], config["out_dir"])
 
     def process(self):
         """
@@ -95,21 +90,27 @@ class LogFileProcessor(Processor):
     def process(self):
         # for debug purpose
         for line in self._fd:
-            #self._process_line(line)
-            pass
-
+            print line
+            self._outhandler.process_line(line)
+        
+        new_fd = open(self._current_file_fullpath, 'r')
         stat = os.stat(self._current_file_fullpath)
-        if stat.st_ino == self._file_state["inode"]:
-            return self
-        else:
+        if stat.st_ino != self._file_state["inode"]:
             log.warn("log file {filename} seems has been rotated".format(filename=self._file_state["filename"]))
             # update the fd infos
             self._fd.close()
             self._file_state["pos"] = 0
             self._file_state["inode"] = stat.st_ino
-            self.update_metainfo()
+            new_fd.close() # there time window between open and os.stat function
             self._fd = open(self._current_file_fullpath, 'r')
-            return self
+        else:
+            current_pos = self._fd.tell()
+            self._file_state["pos"] = current_pos
+            self._fd.close()
+            self._fd = new_fd     
+            self._fd.seek(current_pos, 0)
+        self.update_metainfo()
+        return self
 
     def set_read_postion_to_end(self):
         """
@@ -126,8 +127,10 @@ class RotateFileProcessor(Processor):
 
     def process(self):
         # for debug purpose
+        print "RotateFileProcessor processing"
+        
         for line in self._fd:
-            self._process_line(line)
+            self._outhandler.process_line(line)
         log.info("rotated log file {inode} has been readed. change to real file".format(inode=self._file_state["inode"]))
         real_log_filepath = os.path.join(self._config["monitor_dir"], self._file_state["filename"])
         # there may have a trival bug.
@@ -137,7 +140,7 @@ class RotateFileProcessor(Processor):
         #
         self._file_state["inode"] = inode
         self._file_state["pos"] = 0
-        processor = LogFileProcessor(self._config, self._file_state, fd, self._out_timestamp_dir)
+        processor = LogFileProcessor(self._config, self._file_state, fd)
         return processor
 
 
@@ -298,6 +301,7 @@ def register_mainprocess_sighandler():
     """
         register the signal for the main process.
     """
+    print "register signal handler"
     def signal_handler(dummy_signum, dummy_frame):
         """
             signal handler used to shut down system.
